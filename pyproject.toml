@@ -4,15 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "laya"
-version = "0.3.22"
-description = "Fast, non-autoregressive System 1 decision engine with calibrated probabilities"
+version = "0.3.22+lfa.1"
+description = "Laya for Agents: local typed decisions served over the TypeSafe Jev /v1/systemone wire protocol"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [
-    { name = "Convai Innovations" }
+    { name = "Convai Innovations" },
+    { name = "Laya for Agents contributors" },
 ]
-keywords = ["decision-model", "rlcd", "calibration", "system-one", "routing", "guardrails", "moderation", "triage"]
+keywords = ["decision-model", "rlcd", "calibration", "system-one", "routing", "guardrails",
+            "moderation", "triage", "jev", "hermes", "agents", "local-inference"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
@@ -34,7 +36,7 @@ dependencies = [
 
 [tool.setuptools]
 # assets/, research/ and notebooks/ sit in the root, so auto-discovery bails out.
-packages = ["laya", "laya.mcp", "laya.integrations"]
+packages = ["laya", "laya.mcp", "laya.integrations", "laya_for_agents"]
 
 [project.optional-dependencies]
 # `pip install laya[serve]` adds the HTTP server (laya.serve / the laya-serve CLI).
@@ -77,10 +79,13 @@ crewai = [
 ]
 
 [project.scripts]
+# The first four are upstream Laya's entry points and are unchanged.
 laya = "laya.cli:main"
 laya-serve = "laya.serve:main"
 laya-evals = "laya.evals_cli:main"
 laya-mcp-server = "laya.mcp.server:main"
+# Laya for Agents: the bridge.
+laya-for-agents = "laya_for_agents.cli:main"
 
 [project.urls]
 Homepage = "https://huggingface.co/convaiinnovations/laya"

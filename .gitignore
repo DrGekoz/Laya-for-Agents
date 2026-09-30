@@ -80,3 +80,14 @@ research/*_benchmark_results.json
 # local checkpoint weights, kept out of the tree
 # (fetch them with: python verify/checkpoints.py --fetch)
 models/
+
+# Laya for Agents: the hermes-jev-skills checkout `setup-hermes` clones on demand.
+# A clone, not a fork -- it is the consumer this bridge is built for, and it is
+# installed from upstream on purpose so it stays upstream.
+vendor/
+
+# Laya for Agents: local run logs and the routing pool the live-verification script
+# writes. Nothing here is a source file.
+*.log
+routing.json
+routing-experiment-*.json

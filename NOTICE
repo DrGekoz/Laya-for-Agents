@@ -1,0 +1,46 @@
+Laya for Agents
+===============
+
+This repository is a fork of Laya.
+
+Laya
+----
+Copyright Convai Innovations.
+Licensed under the Apache License, Version 2.0.
+https://github.com/NandhaKishorM/laya
+
+The `laya/` package, `laya-ts/`, `docs/`, `research/`, `benchmarks/`, `scripts/`,
+`sdk/`, `verify/`, `nix/`, `docker/`, `notebooks/` and the upstream test suite are
+Laya's work, unchanged. Upstream's own README is kept verbatim in README-LAYA.md.
+
+The `laya_for_agents/` package, the `tests/test_lfa_*.py` files, the
+`LayaForAgents.bat` launcher and README.md are additions made by this fork.
+
+
+hermes-jev-skills
+-----------------
+Copyright Steve Darlow.
+Licensed under the MIT License.
+https://github.com/kerpopule/hermes-jev-skills
+
+hermes-jev-skills is NOT bundled here. It is the consumer this bridge is built
+for, and `laya-for-agents setup-hermes` clones it from upstream on demand into
+`vendor/hermes-jev-skills` (gitignored, so the copy always tracks upstream
+rather than a stale vendored snapshot).
+
+The tests in `tests/test_lfa_engine.py` named `JevValidatorTests` restate the
+reply invariants that project's `jevkit/client.py` enforces on a decision
+model's response, so a change here that would silently start failing on the
+client is caught locally. They are an independent restatement of a documented
+interface, not copied code.
+
+
+TypeSafe Jev
+------------
+Jev is a product of TypeSafe AI.
+https://docs.typesafe.ai
+
+The `/v1/systemone` wire protocol implemented here is TypeSafe's. This project
+implements the protocol, not the model, and is not affiliated with, endorsed by
+or sponsored by TypeSafe AI. Laya implements the same protocol for its own
+weights, and this fork serves Laya's.
