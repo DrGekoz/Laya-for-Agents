@@ -16,6 +16,7 @@ from __future__ import annotations
 import hmac
 import json
 import logging
+import threading
 from typing import Optional
 
 from starlette.concurrency import run_in_threadpool
@@ -53,12 +54,22 @@ def create_app(settings: Optional[Settings] = None, engine: Optional[Engine] = N
 
     @asynccontextmanager
     async def lifespan(app):
-        try:
-            described = await run_in_threadpool(engine.warm)
-            _log.info("resident: %s on %s", ", ".join(described.get("loaded") or []) or "none",
-                      described.get("device"))
-        except Exception as error:  # noqa: BLE001 - serve anyway, load lazily
-            _log.warning("warm-up failed, checkpoints will load on first use: %s", error)
+        # The preload runs on a thread and is NOT awaited. Awaiting it means uvicorn
+        # never binds the port or answers /health until every checkpoint is built --
+        # measured at 92 s warm and 218 s cold on CPU. For that whole window the
+        # service looks dead: a watchdog kills and restarts it in a loop, and a cron
+        # health check reports it down. Serving immediately and reporting `loading` in
+        # /health is the difference between "warming up" and "crashed".
+        def _preload() -> None:
+            try:
+                described = engine.warm()
+                _log.info("resident: %s on %s", ", ".join(described.get("loaded") or []) or "none",
+                          described.get("device"))
+            except Exception as error:  # noqa: BLE001 - serve anyway, load lazily
+                _log.warning("warm-up failed, checkpoints will load on first use: %s", error)
+
+        if settings.preload:
+            threading.Thread(target=_preload, name="lfa-preload", daemon=True).start()
         yield
 
     app = FastAPI(

@@ -82,6 +82,17 @@ class Engine:
         # wants. Admission is a separate, wider gate, exactly as Laya's own
         # server separates the two.
         self._inference = threading.Lock()
+        # True while checkpoints are being built. Read by /health so a supervisor can
+        # tell "still warming up" from "up and answering" -- a load takes ~90 s warm
+        # and over three minutes cold, and a health check that is silent for three
+        # minutes is a service a watchdog kills in a loop.
+        self.loading = False
+        self.loading_since: Optional[float] = None
+        self.loaded_at: Optional[float] = None
+        # The last known resident set, so describe() has something to answer with when
+        # it cannot safely ask the Router. See describe().
+        self._resident: Dict[str, Any] = {"loaded": [], "loaded_revisions": {}}
+        self._device: Optional[str] = None
         self.stats: Dict[str, Any] = {
             "requests": 0, "single": 0, "multilingual": 0, "scan": 0, "errors": 0, "truncated": 0,
             "tokens_scanned": 0, "last_mode": None, "last_latency_ms": None,
@@ -127,33 +138,90 @@ class Engine:
     def warm(self) -> Dict[str, Any]:
         """Load the checkpoints and return what is resident.
 
+        Blocking, and deliberately so: a caller that wants the load done before it
+        proceeds awaits this. The server does NOT -- it starts this on a thread, so
+        the port is bound and ``/health`` answers while the weights stream in. See
+        ``server.create_app``.
+
         The load happens here rather than inside ``_build`` so an incremental
         preload does not fight the constructor, and so a failure to preload leaves a
         working server that simply loads on first use.
         """
         router = self.router()
-        if self.settings.preload:
-            try:
-                # Names, not a repo mapping: `Router.preload` normalises its arguments.
-                # None means the Router's own default set.
-                router.preload(list(self.settings.models) or None)
-            except Exception as error:  # noqa: BLE001
-                _log.warning("preload failed (checkpoints will load on first use): %s", error)
+        self.loading = True
+        self.loading_since = time.time()
+        try:
+            if self.settings.preload:
+                try:
+                    # Names, not a repo mapping: `Router.preload` normalises its arguments.
+                    # None means the Router's own default set.
+                    router.preload(list(self.settings.models) or None)
+                except Exception as error:  # noqa: BLE001
+                    _log.warning("preload failed (checkpoints will load on first use): %s", error)
+        finally:
+            self.loading = False
+            self.loading_since = None
+            self.loaded_at = time.time()
+        # Read the resident set only now that the flag is clear -- describe() skips the
+        # Router's locking property while a load is in flight, so calling it inside the
+        # try would return the previous snapshot rather than what just loaded.
         return self.describe()
 
     # ── introspection ────────────────────────────────────────────────────────
 
     def describe(self) -> Dict[str, Any]:
-        out: Dict[str, Any] = {"loaded": [], "loaded_revisions": {}, "device": self.settings.device or "auto"}
+        """Report what is resident, without ever taking the Router's lock.
+
+        This is the whole reason this method looks like this. ``Router.load`` holds
+        ``Router._lock`` **across ``Agent(repo, **kwargs)``** -- the entire checkpoint
+        download and build, measured at 92 s warm and 218 s cold on CPU -- and
+        ``Router.loaded`` takes that same lock. So an introspection read during a load
+        blocks for minutes.
+
+        On ``/health`` that is the worst available failure. The TCP connection is
+        accepted, so a port check says "up", and the reply never comes, so a
+        supervisor sees neither a refusal nor an answer and the client hangs until its
+        timeout. Worse than the server being obviously down.
+
+        So the registry attributes are read directly, without the lock. They are
+        maintained under it, but a list/dict read is atomic enough for a diagnostic
+        and it can never block. A stand-in that exposes only the documented
+        ``loaded`` / ``loaded_revisions`` properties is still supported -- those are
+        read when not loading, and skipped entirely while a load is in flight.
+        """
+        device = self._device_report()
         if self._router is None:
-            return out
-        # On Laya's Router both of these are properties, not methods. Reading them
-        # defensively means a version that turns them back into methods, or an
-        # injected stand-in that has them as methods, still reports correctly
-        # instead of silently describing an empty server.
-        out["loaded"] = self._read(self._router, "loaded", [])
-        out["loaded_revisions"] = self._read(self._router, "loaded_revisions", {})
-        out["device"] = self._device_report()
+            return {"loaded": [], "loaded_revisions": {}, "device": device}
+
+        # The real Router: read its registry directly, never through the property.
+        order = getattr(self._router, "_order", None)
+        agents = getattr(self._router, "_agents", None)
+        if isinstance(order, list) and isinstance(agents, dict):
+            try:
+                loaded = list(order)
+                revisions = {name: getattr(agent, "revision", None)
+                             for name, agent in list(agents.items())}
+                if loaded:
+                    self._resident = {"loaded": loaded, "loaded_revisions": revisions}
+                return {"loaded": loaded, "loaded_revisions": revisions, "device": device}
+            except Exception:  # noqa: BLE001 - a diagnostic must never raise
+                pass
+
+        # A stand-in exposing only the documented properties. Safe when nothing is
+        # loading; skipped while something is, because that is exactly when a read
+        # could block.
+        if not self.loading:
+            try:
+                loaded = self._read(self._router, "loaded", [])
+                revisions = self._read(self._router, "loaded_revisions", {})
+                if loaded:
+                    self._resident = {"loaded": loaded, "loaded_revisions": revisions}
+                return {"loaded": loaded, "loaded_revisions": revisions, "device": device}
+            except Exception:  # noqa: BLE001
+                pass
+
+        out = dict(self._resident)
+        out["device"] = device
         return out
 
     @staticmethod
@@ -166,14 +234,22 @@ class Engine:
             return default
 
     def _device_report(self) -> str:
-        try:
-            import torch
+        """Which device the checkpoints actually run on. Resolved once and cached.
 
-            if torch.cuda.is_available():
-                return f"cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})"
-            return "cpu"
-        except Exception:  # noqa: BLE001
-            return self.settings.device or "auto"
+        A health endpoint is polled; probing torch's device on every poll is work for
+        no new information, and the answer cannot change while the process lives.
+        """
+        if self._device is None:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    self._device = f"cuda:{torch.cuda.current_device()} ({torch.cuda.get_device_name(0)})"
+                else:
+                    self._device = "cpu"
+            except Exception:  # noqa: BLE001
+                self._device = self.settings.device or "auto"
+        return self._device
 
     # ── budget policy ────────────────────────────────────────────────────────
 
@@ -414,11 +490,23 @@ class Engine:
             self._admission.release()
 
     def health(self) -> Dict[str, Any]:
-        """The ``/health`` body: what is resident, what it runs on, what it has done."""
+        """The ``/health`` body: what is resident, what it runs on, what it has done.
+
+        ``status`` stays ``ok`` while checkpoints load, because the HTTP surface really
+        is serving -- a plain "is it up" probe should not fail for three minutes and
+        get the process killed. ``loading`` and ``ready`` are the fields a supervisor
+        should actually gate on: ``ready`` means at least one checkpoint is resident
+        and no load is in flight.
+        """
         described = self.describe()
+        loading = self.loading
         return {
             "status": "ok",
             "service": "laya-for-agents",
+            "ready": bool(described["loaded"]) and not loading,
+            "loading": loading,
+            "loading_for_s": (round(time.time() - self.loading_since, 1)
+                              if loading and self.loading_since else None),
             "loaded": described["loaded"],
             "revisions": described["loaded_revisions"],
             "device": described["device"],

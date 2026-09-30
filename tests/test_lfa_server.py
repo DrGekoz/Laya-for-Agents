@@ -31,6 +31,10 @@ except Exception:  # noqa: BLE001
 
 from laya_for_agents.settings import Settings  # noqa: E402
 
+if HAVE_SERVER:
+    from laya_for_agents.server import create_app
+else:  # keep the module importable on a bare Python
+    create_app = None  # type: ignore[assignment]
 
 class FakeEngine:
     """Minimal stand-in for Engine: enough for the HTTP layer to be real."""
@@ -204,6 +208,68 @@ class HttpTests(unittest.TestCase):
             self.fail("expected a 404")
         except urllib.error.HTTPError as error:
             self.assertEqual(error.code, 404)
+
+
+class SlowLoadTests(unittest.TestCase):
+    """The defect this pins: if the preload is awaited in the ASGI lifespan, uvicorn
+    never binds the port until every checkpoint is built -- 92 s warm, 218 s cold.
+    For that whole window the service is unreachable, so a watchdog kills it in a
+    loop and a cron health check reports it down. /health has to answer while the
+    weights are still streaming in.
+    """
+
+    def test_health_answers_while_a_load_is_in_flight(self):
+        release = threading.Event()
+
+        class SlowEngine(FakeEngine):
+            def warm(self):
+                release.wait(timeout=30)      # stands in for the checkpoint load
+                return self.describe()
+
+            def health(self):
+                body = super().health()
+                body["loading"] = not release.is_set()
+                body["ready"] = release.is_set()
+                return body
+
+        engine = SlowEngine()
+        port = _free_port()
+        server = uvicorn.Server(uvicorn.Config(create_app(Settings(host="127.0.0.1", port=port), engine),
+                                              host="127.0.0.1", port=port, log_level="error"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            # The load is still blocked. /health must still answer.
+            deadline = time.time() + 20
+            body = None
+            while time.time() < deadline:
+                try:
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as reply:
+                        self.assertEqual(reply.status, 200)
+                        body = json.loads(reply.read())
+                        break
+                except Exception:  # noqa: BLE001
+                    time.sleep(0.2)
+            self.assertIsNotNone(body, "the server did not answer /health during the load")
+            self.assertTrue(body["loading"])
+            self.assertFalse(body["ready"])
+            self.assertEqual(body["status"], "ok")
+
+            # Release the load and confirm it flips to ready.
+            release.set()
+            deadline = time.time() + 20
+            while time.time() < deadline:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=5) as reply:
+                    body = json.loads(reply.read())
+                if body["ready"]:
+                    break
+                time.sleep(0.2)
+            self.assertTrue(body["ready"], "ready never became true after the load finished")
+            self.assertFalse(body["loading"])
+        finally:
+            release.set()
+            server.should_exit = True
+            thread.join(timeout=10)
 
 
 @unittest.skipUnless(HAVE_SERVER, 'needs the server extras: pip install -e ".[serve]"')

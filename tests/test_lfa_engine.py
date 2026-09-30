@@ -10,6 +10,7 @@ import json
 import math
 import os
 import sys
+import time
 import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -381,6 +382,48 @@ class ReplyTests(unittest.TestCase):
     def test_the_reply_says_which_confidence_style_it_used(self):
         self.assertEqual(self.engine.answer(request("hi"))["laya"]["confidence_style"], "jev")
 
+    def test_health_reports_loading_and_ready(self):
+        engine = Engine(Settings())
+        engine._router = FakeRouter()
+        self.assertTrue(engine.health()["ready"])
+        self.assertFalse(engine.health()["loading"])
+
+    def test_health_is_not_ready_while_loading(self):
+        """A supervisor must be able to tell 'warming up' from 'answering'."""
+        engine = Engine(Settings())
+        engine._router = FakeRouter()
+        engine.loading = True
+        engine.loading_since = time.time()
+        health = engine.health()
+        self.assertTrue(health["loading"])
+        self.assertFalse(health["ready"])
+        self.assertIsNotNone(health["loading_for_s"])
+
+    def test_status_stays_ok_while_loading(self):
+        """The HTTP surface really is serving; a dumb 'is it up' probe must not fail
+        for three minutes and get the process killed."""
+        engine = Engine(Settings())
+        engine._router = FakeRouter()
+        engine.loading = True
+        self.assertEqual(engine.health()["status"], "ok")
+
+    def test_a_load_clears_the_loading_flag(self):
+        engine = Engine(Settings())
+        engine._router = FakeRouter()
+        engine.warm()
+        self.assertFalse(engine.loading)
+        self.assertIsNotNone(engine.loaded_at)
+
+    def test_a_failed_load_still_clears_the_loading_flag(self):
+        class Broken(FakeRouter):
+            def preload(self, names=None):
+                raise RuntimeError("no disk")
+
+        engine = Engine(Settings())
+        engine._router = Broken()
+        engine.warm()
+        self.assertFalse(engine.loading, "a failed load must not leave the service stuck at loading")
+
     def test_health_reports_the_confidence_style(self):
         self.assertEqual(Engine(Settings()).health()["budget"]["confidence_style"], "jev")
 
@@ -563,7 +606,7 @@ class HealthTests(unittest.TestCase):
         engine._router = Broken()
         self.assertIn("english", engine.warm()["loaded"])   # describe() still answers
 
-    def test_a_broken_introspection_still_answers_health(self):
+    def test_a_failed_introspection_still_answers_health(self):
         """Never let a diagnostic take the endpoint down."""
 
         class Hostile(FakeRouter):
@@ -575,6 +618,61 @@ class HealthTests(unittest.TestCase):
         engine._router = Hostile()
         self.assertEqual(engine.describe()["loaded"], [])
         self.assertEqual(engine.health()["status"], "ok")
+
+    def test_describe_never_touches_the_router_lock(self):
+        """The defect this pins, and it is upstream Laya's shape.
+
+        `Router.load` holds `Router._lock` across `Agent(repo, **kwargs)` -- the whole
+        checkpoint build, 92 s warm and 218 s cold -- and `Router.loaded` takes the
+        same lock. So introspecting through the public property during a load blocks
+        for minutes. On /health the connection is accepted and the reply never comes:
+        worse than an obvious refusal, because a supervisor sees an open port and no
+        answer and the client hangs to its timeout.
+        """
+
+        class LockedRouter(FakeRouter):
+            """`loaded` blocks forever, exactly as the real one does while loading."""
+
+            def __init__(self):
+                super().__init__()
+                self._order = ["english"]
+                self._agents = {}
+
+            @property
+            def loaded(self):
+                raise AssertionError("describe() must not read the locking property")
+
+            @property
+            def loaded_revisions(self):
+                raise AssertionError("describe() must not read the locking property")
+
+        engine = Engine(Settings())
+        engine._router = LockedRouter()
+        engine.loading = True
+        described = engine.describe()
+        self.assertEqual(described["loaded"], ["english"])   # read from the registry
+        self.assertEqual(engine.health()["loaded"], ["english"])
+
+    def test_describe_falls_back_to_the_cache_when_it_cannot_read(self):
+        class Opaque(FakeRouter):
+            def __init__(self):
+                super().__init__()
+                self._order = "not a list"
+
+        engine = Engine(Settings())
+        engine._router = Opaque()
+        engine.loading = True                                  # so the property is skipped
+        engine._resident = {"loaded": ["cached"], "loaded_revisions": {}}
+        self.assertEqual(engine.describe()["loaded"], ["cached"])
+
+    def test_health_stays_cheap_when_polled(self):
+        """A polled endpoint must not re-probe torch's device on every call."""
+        engine = Engine(Settings())
+        engine._router = FakeRouter()
+        engine.health()
+        first = engine._device
+        engine.health()
+        self.assertIs(engine._device, first)
 
 
 if __name__ == "__main__":

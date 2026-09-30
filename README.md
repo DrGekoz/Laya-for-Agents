@@ -19,7 +19,7 @@ filter memory, pick compactions, choose skills and drive computer/browser steps
   <img alt="Python" src="https://img.shields.io/badge/python-%3E%3D3.10-3776ab.svg" />
   <img alt="Protocol" src="https://img.shields.io/badge/protocol-Jev%20%2Fv1%2Fsystemone-6f42c1.svg" />
   <img alt="Runs" src="https://img.shields.io/badge/runs-CPU%20%7C%20CUDA-76b900.svg" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-112%20passing-brightgreen.svg" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-121%20passing-brightgreen.svg" />
   <img alt="Fork of" src="https://img.shields.io/badge/fork%20of-NandhaKishorM%2Flaya-orange.svg" />
   <img alt="For" src="https://img.shields.io/badge/built%20for-hermes--jev--skills-4b8bbe.svg" />
   <img alt="No API key" src="https://img.shields.io/badge/API%20key-not%20required-success.svg" />
@@ -108,11 +108,23 @@ looks clean and the model never changes.
 Measured on the live engine before this was fixed, `route.decide()` on four coding prompts:
 
 ```
+BEFORE, Laya's entropy value served as `confidence`:
+
 trivial lookup    tier=None  "low confidence 0.25"   -> kept the current model
 ordinary work     tier=None  "low confidence 0.24"   -> kept the current model
 hard coding       tier=None  "low confidence 0.22"   -> kept the current model
 expert + risky    tier=medium general                 (the one that cleared)
+
+AFTER, Jev's formula served instead:
+
+a small lookup    conf 0.36   a coding turn   conf 0.40
 ```
+
+The metric is now the one the client's thresholds were written for. It is worth being precise about
+what is and is not fixed: a genuine coding turn really does sit around 0.36–0.40 on a 4-level
+rubric, so jevkit's stock 0.6 threshold still will not move the model on an ordinary turn. That
+second part is legitimate configuration, not a mismatch — which is why the step below is still the
+one that matters. Start in shadow mode, read the log, and set your own numbers.
 
 Laya's own documentation says it plainly — *"never compare the two against one threshold"* — and
 this is what that means in practice.
@@ -226,8 +238,42 @@ the state was estimated to be, and how many windows were scanned.
 
 ### `GET /health`
 
-Always open, never touches the inference gate. Reports resident checkpoints, the device, the
-budget policy in force, and counters — so a deployment can confirm what it is really serving.
+Always open, never touches the inference gate, and **answers while checkpoints are still loading**.
+Reports resident checkpoints, the device, the budget policy in force, and counters — so a deployment
+can confirm what it is really serving.
+
+```json
+{
+  "status": "ok",
+  "ready": true,
+  "loading": false,
+  "loading_for_s": null,
+  "loaded": ["english", "multilingual"],
+  "device": "cpu",
+  "budget": {"single_max": 1024, "long_policy": "multilingual", "scan_max_tokens": 8192,
+             "confidence_style": "jev"},
+  "stats": {"requests": 12, "single": 12, "multilingual": 0, "scan": 0, "errors": 0, "truncated": 0}
+}
+```
+
+Gate a **supervisor** on `ready`, not on the status code. `status` stays `ok` throughout, because
+the HTTP surface genuinely is serving — a plain "is it up" probe that fails for three minutes gets
+the process killed and restarted in a loop. `loading` and `loading_for_s` say a load is in flight;
+`loaded` fills in checkpoint by checkpoint, so a working start looks like:
+
+```
+   9s  status=ok  loading=True   ready=False  loaded=[]                       loading_for_s=16.9
+  76s  status=ok  loading=True   ready=False  loaded=['english']              loading_for_s=83.9
+ 105s  status=ok  loading=False  ready=True   loaded=['english','multilingual']
+```
+
+Getting that right took a real fix, and the reason is worth knowing if you touch this code:
+`Router.load` in upstream Laya holds the Router's lock **across the whole `Agent(...)` build**, and
+`Router.loaded` takes that same lock. Introspecting through the documented property during a load
+therefore blocks for minutes. On a health endpoint that is worse than being down — the connection is
+accepted (so a port check says "up") and the reply never arrives (so the client hangs to its
+timeout). `describe()` reads the registry without the lock instead, and skips the property entirely
+while loading.
 
 ### Errors
 
@@ -344,10 +390,10 @@ the long checkpoint.
 
 | path | measured |
 |---|---|
-| checkpoint load, all three, warm disk | 92 s |
+| checkpoint load, warm disk | 92 s (all three) / 105 s (english + multilingual) |
 | checkpoint load, cold disk | 218 s |
-| one routing-sized turn, first call | 6.0 s (includes warm-up) |
-| one routing-sized turn, warm | **1.27 s** median (min 1.22, max 1.38) |
+| one routing-sized turn, first call | 6.0–9.5 s (includes warm-up) |
+| one routing-sized turn, warm | **1.27 s** median (min 1.22, max 1.38); 0.98 s observed later |
 | a 7,700-token state, window-by-window scan | **182 s** over 42 windows |
 
 That last row is why `LFA_SCAN_MAX_TOKENS` defaults to the multilingual window: a decision that
@@ -398,7 +444,7 @@ laya_for_agents/          the bridge — this is what the fork adds
   server.py               the HTTP surface (FastAPI/ASGI)
   cli.py                  serve · doctor · smoke · config · setup-hermes
 tests/
-  test_lfa_protocol.py    112 offline tests: shapes, caps, budgets, dispatch, error mapping
+  test_lfa_protocol.py    121 offline tests: shapes, caps, budgets, dispatch, error mapping
   test_lfa_engine.py
   test_lfa_server.py      the real ASGI app over a real socket, with a fake engine
 lfa_verify_live.py        end-to-end against a running server, using the consumer's own client
@@ -421,7 +467,7 @@ git fetch upstream && git merge upstream/main
 python -m unittest discover -s tests -p "test_lfa_*.py"
 ```
 
-112 tests, no torch and no checkpoint required — a fake router stands in, and the HTTP tests run
+121 tests, no torch and no checkpoint required — a fake router stands in, and the HTTP tests run
 the real ASGI app on a real socket. They pin the things that would otherwise fail silently: that a
 long state is *sent to the long checkpoint* rather than cut, that no request is ever given a window
 smaller than it needs, that a scan too large to finish in time is refused instead of hanging, that a
