@@ -5,6 +5,7 @@
     laya-for-agents smoke            load a checkpoint and answer one real question set
     laya-for-agents config           print the environment a client needs
     laya-for-agents setup-hermes     install hermes-jev-skills and point it here
+    laya-for-agents install-gateway-hook    start this server with every gateway boot
 
 ``serve`` is the only subcommand that needs the server extras; the rest run on a
 bare Python so a broken install can still be diagnosed.
@@ -20,6 +21,16 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional
+
+from . import __version__ as LFA_VERSION
+from .gateway_hook import (
+    DISABLE_ENV as DISABLE_HOOK_ENV,
+    find_hermes_home,
+    gateway_hook_status,
+    hermes_homes,
+    install_gateway_hook,
+    uninstall_gateway_hook,
+)
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VENDOR = PROJECT_ROOT / "vendor"
@@ -42,34 +53,12 @@ def _fail(label: str, detail: str = "") -> None:
 
 
 def _hermes_homes() -> List[Path]:
-    """Every Hermes home on this machine, most specific first.
-
-    Windows keeps the active profile under ``%LOCALAPPDATA%\\hermes``; elsewhere
-    it is ``~/.hermes``. Both are checked, and a profile home is preferred over
-    the shared root because that is where the running gateway reads its ``.env``.
-    """
-    out: List[Path] = []
-    env_home = os.environ.get("HERMES_HOME")
-    if env_home:
-        out.append(Path(env_home))
-    local = os.environ.get("LOCALAPPDATA")
-    if local:
-        out.append(Path(local) / "hermes")
-    out.append(Path.home() / ".hermes")
-    seen, unique = set(), []
-    for path in out:
-        key = str(path).lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
+    """Every Hermes home on this machine, most specific first (see gateway_hook)."""
+    return hermes_homes()
 
 
 def _find_hermes_home() -> Optional[Path]:
-    for home in _hermes_homes():
-        if (home / "config.yaml").is_file() or (home / ".env").is_file():
-            return home
-    return None
+    return find_hermes_home()
 
 
 def _env_value(path: Path, key: str) -> Optional[str]:
@@ -131,6 +120,28 @@ def _base_url(host: str, port: int) -> str:
     # advertised base URL always uses 127.0.0.1 rather than a hostname.
     shown = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
     return f"http://{shown}:{port}"
+
+
+def _probe_laya(host: str, port: int, timeout: float = 2.5) -> Optional[Dict[str, Any]]:
+    """This server's /health body when it owns the port, else None.
+
+    Answers "is the thing on this port *us*", which is the question both the
+    doctor and the gateway hook need. A foreign listener, a proxy error page, or
+    a server that answers a different protocol all read as None.
+    """
+    import urllib.request
+
+    shown = "127.0.0.1" if host in ("0.0.0.0", "::", "localhost") else host
+    try:
+        with urllib.request.urlopen(f"http://{shown}:{port}/health", timeout=timeout) as response:
+            if response.status != 200:
+                return None
+            body = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:  # noqa: BLE001
+        return None
+    if isinstance(body, dict) and body.get("service") == "laya-for-agents":
+        return body
+    return None
 
 
 # ── subcommands ──────────────────────────────────────────────────────────────
@@ -201,8 +212,18 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
     if free:
         _ok(f"port {settings.port} free")
     else:
-        problems += 1
-        _fail(f"port {settings.port} already in use", "another server is running, or change LFA_PORT")
+        # The port being taken is only a problem when it is somebody else's. With
+        # the gateway hook installed this server is normally already up, and a
+        # doctor run that cried "problem" every time would train people to
+        # ignore it.
+        live = _probe_laya(settings.host, settings.port)
+        if live is not None:
+            state = "ready" if live.get("ready") else "loading checkpoints"
+            _ok(f"port {settings.port} already serving", f"this server is up ({state})")
+        else:
+            problems += 1
+            _fail(f"port {settings.port} already in use",
+                  "another server is running, or change LFA_PORT")
 
     _ok("budget policy",
         f"single_max={settings.single_max}  max_token_budget={settings.max_token_budget}  "
@@ -229,6 +250,14 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
         else:
             _warn("TYPESAFE_BASE_URL not set in the Hermes .env",
                   "run:  laya-for-agents setup-hermes")
+        hook = gateway_hook_status(home)
+        if hook.get("installed"):
+            _ok("gateway startup hook installed",
+                f"{hook['directory']}  (event {', '.join(hook.get('events', []))})")
+        else:
+            _warn("gateway startup hook not installed",
+                  "the server only runs while you leave it running;  "
+                  "run:  laya-for-agents install-gateway-hook")
     else:
         _warn("no Hermes home found", "nothing to wire up")
 
@@ -303,10 +332,111 @@ def cmd_config(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hook_check(handler: Path) -> List[str]:
+    """Import the freshly written handler and return anything wrong with it.
+
+    Importing (rather than eyeballing) is the check that matters: the file is
+    executed by the gateway with no Laya imports available, so if it cannot be
+    loaded on a bare interpreter it would fail there too.
+    """
+    import importlib.util
+
+    problems: List[str] = []
+    spec = importlib.util.spec_from_file_location("lfa_gateway_hook_check", handler)
+    if spec is None or spec.loader is None:
+        return [f"cannot load {handler}"]
+    module = importlib.util.module_from_spec(spec)
+    try:
+        spec.loader.exec_module(module)
+    except Exception as error:  # noqa: BLE001
+        return [f"handler.py does not import: {error}"]
+    for attribute in ("handle", "_target", "_health"):
+        if not hasattr(module, attribute):
+            problems.append(f"handler.py has no {attribute}()")
+    if hasattr(module, "handle") and not _is_async(module.handle):
+        problems.append("handle() is not async (the gateway awaits it)")
+    if hasattr(module, "PYTHON") and not Path(module.PYTHON).exists():
+        problems.append(f"baked interpreter is missing: {module.PYTHON}")
+    return problems
+
+
+def _is_async(function: Any) -> bool:
+    import inspect
+
+    return inspect.iscoroutinefunction(function)
+
+
+def _report_hook(result: Any, *, verb: str) -> None:
+    label = "would write" if result.dry_run else verb
+    for name in result.changed:
+        _ok(f"{label} {name}", str(result.directory / name))
+    if not result.changed:
+        _ok("already up to date", str(result.directory))
+    if result.changed and not result.dry_run:
+        problems = _hook_check(result.handler)
+        if problems:
+            for problem in problems:
+                _fail(problem)
+        else:
+            _ok("handler.py loads", "handle() present (stdlib-only, gateway-safe)")
+
+
+def cmd_install_gateway_hook(args: argparse.Namespace) -> int:
+    """Write the gateway:startup hook so the server runs whenever Hermes does."""
+    from .settings import load as load_settings
+
+    print("Laya for Agents - install-gateway-hook")
+    home: Optional[Path] = Path(args.home) if args.home else _find_hermes_home()
+    if home is None:
+        _fail("no Hermes home found", "pass --home <dir> if it lives somewhere unusual")
+        return 2
+    settings = load_settings()
+    base = args.base_url or _base_url(settings.host, settings.port)
+    print(f"hermes home   {home}")
+    print(f"endpoint      {base}")
+    try:
+        result = install_gateway_hook(
+            home,
+            project_root=Path(args.project_root) if args.project_root else PROJECT_ROOT,
+            python_exe=Path(args.python) if args.python else Path(sys.executable),
+            base_url=base,
+            dry_run=args.dry_run,
+        )
+    except RuntimeError as error:
+        _fail(str(error))
+        return 2
+
+    _report_hook(result, verb="wrote")
+    print(f"  [ OK ] log file  {result.log_file}")
+    print()
+    print("The gateway loads hooks once, at startup, from <hermes home>/hooks/.")
+    print("Restart it so this takes effect:   hermes gateway restart")
+    print("Fired once per boot: already-running server is left alone, a port held by")
+    print(f"something else is reported and never fought over. Disable with {DISABLE_HOOK_ENV}=off.")
+    return 0
+
+
+def cmd_uninstall_gateway_hook(args: argparse.Namespace) -> int:
+    """Remove the gateway:startup hook (the running server is left running)."""
+    print("Laya for Agents - uninstall-gateway-hook")
+    home: Optional[Path] = Path(args.home) if args.home else _find_hermes_home()
+    if home is None:
+        _fail("no Hermes home found", "pass --home <dir> if it lives somewhere unusual")
+        return 2
+    result = uninstall_gateway_hook(home, dry_run=args.dry_run)
+    if result.changed:
+        _ok("would remove" if args.dry_run else "removed", str(result.directory))
+        print("  a server started by the hook keeps running until you stop it (Ctrl+C in")
+        print("  its window, or close the LayaForAgents.bat console).")
+    else:
+        _ok("nothing to remove", "the hook was not installed")
+    return 0
+
+
 def cmd_setup_hermes(args: argparse.Namespace) -> int:
     """Install hermes-jev-skills and point it at this server."""
     print("Laya for Agents - setup-hermes")
-    home = _find_hermes_home()
+    home = Path(args.home) if getattr(args, "home", None) else _find_hermes_home()
     if home is None:
         _fail("no Hermes home found", "is Hermes installed on this machine?")
         return 2
@@ -358,13 +488,32 @@ def cmd_setup_hermes(args: argparse.Namespace) -> int:
     else:
         _ok("Hermes .env already correct", f"TYPESAFE_BASE_URL={base}")
 
+    # 4. keep the engine running: a gateway:startup hook, so "gateway is up"
+    #    always implies "the decision server is up". Without it the plugin's
+    #    calls fail open and every turn costs a timeout.
+    if args.no_gateway_hook:
+        _warn("gateway startup hook skipped", "--no-gateway-hook")
+    else:
+        try:
+            hook = install_gateway_hook(
+                home,
+                project_root=PROJECT_ROOT,
+                python_exe=Path(sys.executable),
+                base_url=base,
+                dry_run=args.dry_run,
+            )
+        except RuntimeError as error:
+            _fail("gateway hook failed", str(error))
+            return 1
+        _report_hook(hook, verb="wrote")
+        print(f"  [ OK ] log file  {hook.log_file}")
+
     print()
     print("Next:")
     print(f"  1. start the engine:   laya-for-agents serve")
-    print(f"  2. restart the Hermes gateway so it picks up {env_path.name}")
+    print(f"  2. restart the Hermes gateway so it picks up {env_path.name} and the hook")
     print( "  3. start in shadow mode:  /jev routing shadow")
     return 0
-
 
 # ── entry point ──────────────────────────────────────────────────────────────
 
@@ -372,7 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="laya-for-agents",
         description="Run the TypeSafe Jev /v1/systemone wire protocol on a local Laya checkpoint.")
-    parser.add_argument("--version", action="version", version="laya-for-agents 1.0.0")
+    parser.add_argument("--version", action="version", version=f"laya-for-agents {LFA_VERSION}")
     subs = parser.add_subparsers(dest="command")
 
     serve = subs.add_parser("serve", help="run the decision server")
@@ -392,11 +541,28 @@ def build_parser() -> argparse.ArgumentParser:
     config = subs.add_parser("config", help="print the environment a client needs")
     config.set_defaults(func=cmd_config)
 
-    setup = subs.add_parser("setup-hermes", help="install hermes-jev-skills and point it here")
+    setup = subs.add_parser("setup-hermes", help="install hermes-jev-skills, point it here, and start with the gateway")
+    setup.add_argument("--home", default=None, help="Hermes home (defaults to the one the gateway uses)")
     setup.add_argument("--jev-skills", default=None, help="path to an existing hermes-jev-skills checkout")
     setup.add_argument("--proxy-key", default=None, help="value for JEV_PROXY_API_KEY (only if LFA_API_KEY is set)")
+    setup.add_argument("--no-gateway-hook", action="store_true",
+                       help="skip the gateway:startup hook that keeps the server running")
     setup.add_argument("--dry-run", action="store_true")
     setup.set_defaults(func=cmd_setup_hermes)
+
+    hook = subs.add_parser("install-gateway-hook",
+                           help="install the gateway:startup hook that runs this server with Hermes")
+    hook.add_argument("--home", default=None, help="Hermes home (defaults to the one the gateway uses)")
+    hook.add_argument("--project-root", default=None, help="checkout to serve from (defaults to this one)")
+    hook.add_argument("--python", default=None, help="interpreter for the server (defaults to this one)")
+    hook.add_argument("--base-url", default=None, help="endpoint to serve (defaults to this install's)")
+    hook.add_argument("--dry-run", action="store_true")
+    hook.set_defaults(func=cmd_install_gateway_hook)
+
+    unhook = subs.add_parser("uninstall-gateway-hook", help="remove that hook again")
+    unhook.add_argument("--home", default=None, help="Hermes home (defaults to the one the gateway uses)")
+    unhook.add_argument("--dry-run", action="store_true")
+    unhook.set_defaults(func=cmd_uninstall_gateway_hook)
 
     return parser
 

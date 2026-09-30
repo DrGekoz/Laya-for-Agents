@@ -19,7 +19,7 @@ filter memory, pick compactions, choose skills and drive computer/browser steps
   <img alt="Python" src="https://img.shields.io/badge/python-%3E%3D3.10-3776ab.svg" />
   <img alt="Protocol" src="https://img.shields.io/badge/protocol-Jev%20%2Fv1%2Fsystemone-6f42c1.svg" />
   <img alt="Runs" src="https://img.shields.io/badge/runs-CPU%20%7C%20CUDA-76b900.svg" />
-  <img alt="Tests" src="https://img.shields.io/badge/tests-121%20passing-brightgreen.svg" />
+  <img alt="Tests" src="https://img.shields.io/badge/tests-136%20passing-brightgreen.svg" />
   <img alt="Fork of" src="https://img.shields.io/badge/fork%20of-NandhaKishorM%2Flaya-orange.svg" />
   <img alt="For" src="https://img.shields.io/badge/built%20for-hermes--jev--skills-4b8bbe.svg" />
   <img alt="No API key" src="https://img.shields.io/badge/API%20key-not%20required-success.svg" />
@@ -186,7 +186,9 @@ laya-for-agents doctor          # torch, device, checkpoints, port, budget, Herm
 laya-for-agents smoke           # load a checkpoint and answer one real question set
 laya-for-agents serve           # then, in another terminal:
 python lfa_verify_live.py       # drives hermes-jev-skills' own client at this server
-laya-for-agents setup-hermes    # install hermes-jev-skills and point it at this server
+laya-for-agents setup-hermes    # install hermes-jev-skills, point it at this server, and
+                                # install the hook that starts it with every gateway boot
+laya-for-agents doctor          # ...and re-report whether that hook is in place
 ```
 
 `lfa_verify_live.py` is the one that proves the wiring: it imports the consumer's
@@ -302,8 +304,10 @@ command — so `hermes update` does not break it and nothing in Hermes core is p
 laya-for-agents setup-hermes
 ```
 
-That clones the skill pack, runs its installer, and writes `TYPESAFE_BASE_URL` into the Hermes
-`.env` (backing the file up first). Then restart the gateway and start in shadow mode:
+That clones the skill pack, runs its installer, writes `TYPESAFE_BASE_URL` into the Hermes
+`.env` (backing the file up first), and installs the gateway startup hook described below — so
+"the gateway is up" also means "the decision server is up". Then restart the gateway and start in
+shadow mode:
 
 ```
 /jev                        status
@@ -323,6 +327,43 @@ That clones the skill pack, runs its installer, and writes `TYPESAFE_BASE_URL` i
   "jev": {"reachable": true}
 }
 ```
+
+### Keeping the server running
+
+Pointing Hermes at the engine is only half the wiring: the plugin calls it on *every turn*, and a
+loopback endpoint that is not listening does not fail loudly — Jev reads a failed call as "no
+opinion" and the turn carries on, so a forgotten server is a silent cost rather than an error.
+
+So `setup-hermes` also installs a Hermes **gateway startup hook**: two files under
+`<hermes home>/hooks/laya-startup/` (`HOOK.yaml` + `handler.py`), which Hermes fires with
+`gateway:startup` every time the messaging gateway boots. The handler:
+
+- probes `/health` first and **leaves a live server alone** — a gateway restart is a no-op, not a
+  second copy;
+- refuses to start anything when the port is held by a process that does not answer as Laya,
+  instead of fighting it for the bind;
+- spawns the server **detached** (its own process group, stdout appended to
+  `laya_gateway_startup.log`), so it survives gateway restarts;
+- waits for `ready` on a **background thread** — startup never blocks on a two-minute checkpoint
+  load — and writes every decision (already running / port busy / spawned pid / ready in Ns) to
+  that log.
+
+Both files run in the gateway process, so the handler is stdlib-only: no torch, no Laya imports.
+
+```bash
+laya-for-agents install-gateway-hook      # write/refresh them (idempotent)
+laya-for-agents uninstall-gateway-hook    # remove them again
+```
+
+`install-gateway-hook` bakes this machine's paths in — the endpoint, the interpreter, the checkout
+to serve from, the log — and then **imports the file it just wrote** on a bare interpreter, because
+a handler that cannot be loaded is worse than no handler at all. Pass `--home`, `--python`,
+`--project-root` or `--base-url` to point it at a different profile, interpreter or port, or
+`--dry-run` to see what it would write.
+
+Nothing about it is magic or permanent: delete the directory, run the uninstall command, or set
+`LFA_GATEWAY_AUTOSTART=off` in the gateway's environment. `laya-for-agents doctor` reports whether
+the hook is installed.
 
 Two things about the Hermes side worth knowing before you turn anything on:
 
@@ -442,11 +483,13 @@ laya_for_agents/          the bridge — this is what the fork adds
   protocol.py             the Jev wire protocol: validation, estimation, confidence, envelopes
   engine.py               the Router plus the budget policy that makes it safe
   server.py               the HTTP surface (FastAPI/ASGI)
-  cli.py                  serve · doctor · smoke · config · setup-hermes
+  gateway_hook.py         the gateway:startup hook that runs the server with Hermes
+  cli.py                  serve · doctor · smoke · config · setup-hermes · gateway-hook
 tests/
-  test_lfa_protocol.py    121 offline tests: shapes, caps, budgets, dispatch, error mapping
+  test_lfa_protocol.py    offline tests: shapes, caps, budgets, dispatch, error mapping
   test_lfa_engine.py
   test_lfa_server.py      the real ASGI app over a real socket, with a fake engine
+  test_lfa_gateway_hook.py  the hook as written, imported the way the gateway imports it
 lfa_verify_live.py        end-to-end against a running server, using the consumer's own client
 LayaForAgents.bat         launcher
 laya/                      upstream Laya, unchanged
@@ -467,7 +510,7 @@ git fetch upstream && git merge upstream/main
 python -m unittest discover -s tests -p "test_lfa_*.py"
 ```
 
-121 tests, no torch and no checkpoint required — a fake router stands in, and the HTTP tests run
+136 tests, no torch and no checkpoint required — a fake router stands in, and the HTTP tests run
 the real ASGI app on a real socket. They pin the things that would otherwise fail silently: that a
 long state is *sent to the long checkpoint* rather than cut, that no request is ever given a window
 smaller than it needs, that a scan too large to finish in time is refused instead of hanging, that a

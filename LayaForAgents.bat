@@ -20,8 +20,13 @@ echo.
 echo   endpoint : http://127.0.0.1:8000/v1/systemone
 echo   health   : http://127.0.0.1:8000/health
 echo.
-echo   To use it from Hermes, set in the Hermes .env:
+echo   To use it from Hermes, it needs one .env entry and one hook:
 echo     TYPESAFE_BASE_URL=http://127.0.0.1:8000
+echo   Do both at once, and make Hermes start this server whenever the
+echo   gateway starts, with:
+echo     .venv\Scripts\python.exe -m laya_for_agents.cli setup-hermes
+echo   [already wired up?  install-gateway-hook refreshes the hook alone,
+echo    uninstall-gateway-hook removes it, doctor reports whether it is there]
 echo.
 echo   Ctrl+C stops the server.
 echo.

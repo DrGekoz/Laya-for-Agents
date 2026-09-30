@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "laya"
-version = "0.3.22+lfa.1"
+version = "0.3.22+lfa.2"
 description = "Laya for Agents: local typed decisions served over the TypeSafe Jev /v1/systemone wire protocol"
 readme = "README.md"
 requires-python = ">=3.10"
