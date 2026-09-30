@@ -502,6 +502,110 @@ this fork possible and what it is tested against; its `client.ask()` docstring i
 projects above speak. Laya for Agents implements its wire protocol, not its weights, and is not
 affiliated with TypeSafe.
 
+## Dispatch: sending the job to the seat Laya picked
+
+The decision is only half of it. Nothing in Laya or jevkit opens a connection — the client puts it
+plainly, *"the plugin can swap a model but not a provider connection"*, so escalation is a delegation
+signal and the agent is the hand. `lfa_dispatch.py` is that hand, and it keeps three jobs separate:
+
+| | |
+|---|---|
+| `targets` | the fixed rung id → command map, written by a person, in the file |
+| `ladder` | which seat is free, from jevkit's ladder — this is what runs the SSH probes |
+| `run` | executes the chosen rung, with the task on stdin |
+
+```bash
+python lfa_dispatch.py targets
+python lfa_dispatch.py ladder choose              # real SSH probe, ~5 s round trip
+python lfa_dispatch.py run --rung rygel-codex --task -     # job on stdin
+python lfa_dispatch.py selftest                   # offline: no network, no model
+```
+
+The safety rules are the point of the file, not decoration:
+
+* **A rung id is only accepted if it is in `TARGETS`.** Laya returns ids from a table it was handed,
+  so it cannot invent a destination and neither can anything that spoke to it.
+* **The task travels on stdin, never in a command line.** `codex exec -` reads its prompt from stdin,
+  so the job text is never parsed by a shell — not locally, not on the far side of the ssh. The
+  selftest asserts this with a hostile string.
+* **The model is pinned explicitly** (`-m gpt-5.6-luna`) so an edit to the remote `config.toml`
+  cannot quietly move work onto a model you did not choose.
+* **The sandbox is `workspace-write`**, not the blanket bypass flag.
+
+### The thresholds, set from measurement
+
+Write `routing.json` to `<hermes root>/jev/` (here `%LOCALAPPDATA%\hermes\jev\`). jevkit's defaults
+were tuned against Jev's confidence, so two of the four had to move. Measured over eight coding
+prompts against this engine:
+
+| prompt class | difficulty | P(trivial) | P(substantial or expert) | confidence |
+|---|---|---|---|---|
+| trivial ("say OK") | 1.08 – 1.19 | 0.21 – 0.24 | 0.29 – 0.36 | 0.24 – 0.29 |
+| routine ("add a docstring") | 1.43 – 1.46 | 0.07 – 0.10 | 0.49 | 0.26 – 0.27 |
+| hard ("make the pipeline resume") | 1.66 – 1.93 | 0.02 – 0.04 | 0.63 – 0.78 | 0.41 – 0.48 |
+| expert ("migrate off the ORM") | 1.89 – 1.97 | 0.01 – 0.02 | 0.75 – 0.86 | 0.34 – 0.75 |
+
+Two findings worth the table:
+
+* **`hard_needs_probability: 0.60` needed no change.** It separates cleanly — routine tops out at
+  0.49, hard starts at 0.63. Worth saying because the assumption going in was that all four
+  thresholds were wrong; only two were.
+* **`simple_needs_probability: 0.70` was unreachable.** Laya's P(trivial) tops out at 0.24 even for
+  "say OK", so nothing would ever have dropped to the cheapest tier. Set to `0.20`.
+
+Also set: `min_confidence: 0.30` (clears everything but the two genuinely trivial turns),
+`simple_needs_confidence: 0.25`. Eight prompts on one checkpoint is a small sample — treat these as a
+starting point and let `jev route shadow` move them.
+
+### What was actually verified
+
+The ladder, against a real host:
+
+```
+$ jev ladder choose
+{ "rung": "rygel-codex", "kind": "delegate", "forced": false,
+  "reason": "rygel-codex is the first choice" }        # 4.9 s — a real ssh round trip to sanfrancisco
+```
+
+The dispatch, with a real job, verified by reading the result back off the remote machine rather than
+trusting the exit code:
+
+```
+$ python lfa_dispatch.py run --rung rygel-codex --task "Create a file named LAYA_DISPATCH_PROBE.txt ..."
+  exit_code: 0   14.7 s   workdir: /home/gekoz/codex-runs   model: gpt-5.6-luna
+  sandbox: workspace-write [workdir, /tmp, $TMPDIR]        approval: never
+
+$ ssh rygel-sf 'cat /home/gekoz/codex-runs/LAYA_DISPATCH_PROBE.txt'
+  dispatched from laya-for-agents.
+  sha256 cb5f53c7f725c2367320f8cfee58ea9e845a4dfb10afd5825b3efa3bcde20360
+```
+
+### One thing that does *not* work yet, said plainly
+
+`route_to` — Laya choosing between destinations — is verified as **safe, and it declines.** On a
+three-option choice (two destinations plus the `none_fits` escape) this checkpoint returns
+near-uniform probabilities and picks `none_fits` every time, so the router fails through to its
+fallback. Measured across short prompts, a detailed multi-paragraph turn, and with custom
+instructions:
+
+```
+dest=keep-local   routed=False  pick=none_fits   conf=0.0846  margin=0.0457
+dest=keep-local   routed=False  pick=none_fits   conf=0.2724  margin=0.1948
+```
+
+Lowering the confidence floor does not change it — the `dest.choice != none_fits` rule is what
+blocks, and that is the correct place for it. So the mechanism is exercised end to end (policy
+evaluated, margin computed, fallback honoured) but it has not routed a job on its own evidence.
+
+Two honest readings, and only measurement settles which: either the checkpoint's probabilities on a
+3-way choice are too flat to separate destinations at this size, in which case fit temperatures on
+your own examples first; or the decision genuinely is "no clear fit", which is a useful answer and
+exactly why the escape exists. Do not lower the floor to force a route — that buys a routing decision
+with a coin flip.
+
+The ladder path does not have this problem: it is driven by the difficulty and risk answers, and on
+the same measurements `hard_needs_probability: 0.60` separates hard work from routine cleanly.
+
 ## License
 
 Apache-2.0, inherited from Laya. Upstream copyright and attribution are unchanged; see

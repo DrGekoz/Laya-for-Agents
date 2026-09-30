@@ -1,0 +1,5 @@
+{
+  "keep-local": "Do the work here on this machine, using the session's own tools and the files already open. Best when the change is tangled with this repo, when the conversation already holds the context, or when the job is small enough that handing it off costs more than doing it.",
+
+  "rygel-codex": "Send the job to Codex CLI running on the sanfrancisco box over SSH: a separate machine with its own authenticated agent, its own filesystem and no memory of this conversation. Best for a self-contained change that stands on its own, a long unattended run that would otherwise block this machine for hours, or a second opinion that must not inherit this session's assumptions."
+}
